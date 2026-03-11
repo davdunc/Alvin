@@ -36,7 +36,7 @@ User: "session review"
 
 | Workflow | Triggers | File |
 |----------|----------|------|
-| **MorningPrep** | "morning prep", "game plan", "stocks in play" | `Workflows/MorningPrep.md` |
+| **MorningPrep** | "morning prep", "game plan", "stocks in play", "big picture", "market regime", "second day plays", "2nd day plays", "in the news" | `Workflows/MorningPrep.md` |
 | **TradeSetup** | "trade setup", "evaluate setup", "position size", "should I trade" | `Workflows/TradeSetup.md` |
 | **IngestTrades** | "ingest trades", "import trades", "end of day import", "load today's trades" | `Workflows/IngestTrades.md` |
 | **SessionReview** | "session review", "daily review", "how did I do", "end of day review" | `Workflows/SessionReview.md` |
@@ -51,6 +51,19 @@ User: "session review"
 |------|---------|
 | `Tools/TradeLogger.ts` | Ingest broker CSVs, compute stats, generate reviews, manual trade entry |
 | `Tools/ChartGen.ts` | Generate interactive candlestick charts with entry/exit markers |
+
+### CLI Commands (`uv run tradekit`)
+
+| Command | Purpose |
+|---------|---------|
+| `tradekit regime` | Market regime summary — SPY/QQQ/VIX, sector breadth, key levels |
+| `tradekit second-day` | Scan for 2nd-day play candidates from yesterday's big movers |
+| `tradekit scan` | Pre-market gap and volume scanner |
+| `tradekit analyze <TICKER>` | Deep technical analysis on a single ticker |
+| `tradekit levels <TICKER>` | Support and resistance levels |
+| `tradekit watchlist` | Review personal watchlist with pre-market data |
+| `tradekit morning` | Full morning workflow: scan + analyze top picks |
+| `tradekit report` | Generate and save daily markdown report |
 
 Both tools are Bun CLI scripts. Run via `bun run Tools/<tool>.ts <command> [options]`.
 
