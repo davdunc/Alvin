@@ -93,6 +93,84 @@ def scan_premarket(
     return df.head(max_results)
 
 
+def scan_previous_movers(
+    provider: Any = None,
+    min_change_pct: float = 5.0,
+    min_volume_ratio: float = 1.5,
+) -> pd.DataFrame:
+    """Find stocks that moved >min_change_pct yesterday with above-avg volume.
+
+    Uses Finviz top gainers/losers from the previous session, then enriches
+    with Yahoo pre-market data for continuation signals.
+
+    Returns:
+        DataFrame with columns: ticker, name, prev_close, prev_change_pct,
+        volume_ratio, pre_price, pre_gap_pct.
+    """
+    if provider is None:
+        provider = YahooProvider()
+
+    finviz = FinvizProvider()
+    logger.info("Fetching top gainers for 2nd-day scan...")
+    gainers_df = finviz.get_top_gainers(min_price=3.0)
+
+    tickers: list[str] = []
+    if not gainers_df.empty:
+        col = next((c for c in gainers_df.columns if c.lower() == "ticker"), None)
+        if col:
+            tickers = gainers_df[col].tolist()
+
+    if not tickers:
+        logger.warning("No previous movers found from Finviz")
+        return pd.DataFrame()
+
+    logger.info("Enriching %d candidates with market data...", len(tickers))
+    rows = []
+    for ticker in tickers[:20]:
+        try:
+            quote = provider.get_quote(ticker)
+            price = quote.get("price", 0)
+            prev_close = quote.get("prev_close", 0)
+            volume = quote.get("volume", 0)
+            avg_volume = quote.get("avg_volume", 1)
+
+            if not prev_close:
+                continue
+
+            change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0
+            vol_ratio = volume / avg_volume if avg_volume else 0
+
+            # Get pre-market data for continuation signal
+            pre = provider.get_premarket(ticker)
+
+            rows.append({
+                "ticker": ticker,
+                "name": quote.get("name", ticker),
+                "price": price,
+                "prev_close": prev_close,
+                "prev_change_pct": round(change_pct, 2),
+                "volume_ratio": round(vol_ratio, 2),
+                "pre_price": pre.get("pre_price", 0),
+                "pre_gap_pct": pre.get("gap_pct", 0),
+                "has_premarket": pre.get("has_premarket", False),
+            })
+        except Exception as e:
+            logger.warning("Failed to fetch %s: %s", ticker, e)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Filter by minimum change and volume ratio
+    df = df[df["prev_change_pct"].abs() >= min_change_pct]
+    if not df.empty and min_volume_ratio > 0:
+        df = df[df["volume_ratio"] >= min_volume_ratio]
+
+    df = df.sort_values("prev_change_pct", key=abs, ascending=False).reset_index(drop=True)
+    return df
+
+
 def scan_watchlist(
     settings: Settings | None = None,
     watchlist_name: str = "default",

@@ -8,7 +8,7 @@ from rich.console import Console
 
 from tradekit.config import get_settings, now_et
 
-console = Console()
+console = Console(force_terminal=True)
 logger = logging.getLogger("tradekit")
 
 source_option = click.option(
@@ -73,7 +73,7 @@ def cli(verbose: bool):
 @cli.command()
 @click.option("--preset", default="premarket_gap", help="Screener preset name.")
 @click.option("--min-gap", type=float, default=None, help="Override minimum gap %.")
-@click.option("--min-volume", type=int, default=None, help="Override minimum pre-market volume.")
+@click.option("--min-volume", type=int, default=None, help="Override minimum avg daily volume.")
 @click.option("--max-price", type=float, default=None, help="Override maximum price.")
 @source_option
 def scan(
@@ -91,7 +91,7 @@ def scan(
     if min_gap is not None:
         settings.screener.min_gap_pct = min_gap
     if min_volume is not None:
-        settings.screener.min_premarket_volume = min_volume
+        settings.screener.min_avg_volume = min_volume
     if max_price is not None:
         settings.screener.max_price = max_price
 
@@ -254,6 +254,212 @@ def watchlist(name: str, source: str | None):
 
     df = scan_watchlist(settings=settings, watchlist_name=name, provider=provider)
     print_scan_results(df, title=f"Watchlist: {name}")
+
+
+@cli.command()
+@source_option
+def regime(source: str | None):
+    """Show market regime summary: SPY/QQQ/VIX + sector breadth."""
+    from rich.table import Table
+
+    from tradekit.analysis.indicators import compute_all_indicators, compute_rsi
+    from tradekit.analysis.levels import find_support_resistance, get_nearest_levels
+
+    provider = get_provider(source)
+
+    # --- Index + VIX overview ---
+    index_table = Table(title="Market Regime", show_lines=True, pad_edge=True)
+    index_table.add_column("Symbol", style="bold cyan", width=6)
+    index_table.add_column("Price", justify="right", width=10)
+    index_table.add_column("Chg%", justify="right", width=8)
+    index_table.add_column("vs SMA20", justify="right", width=9)
+    index_table.add_column("vs SMA50", justify="right", width=9)
+    index_table.add_column("vs SMA200", justify="right", width=9)
+    index_table.add_column("RSI", justify="right", width=6)
+    index_table.add_column("Label", width=12)
+
+    for sym in ("SPY", "QQQ", "^VIX"):
+        display = sym.replace("^", "")
+        try:
+            quote = provider.get_quote(sym)
+            price = quote.get("price", 0)
+            prev = quote.get("prev_close", 0)
+            chg_pct = ((price - prev) / prev * 100) if prev else 0
+            chg_style = "green" if chg_pct >= 0 else "red"
+
+            df = provider.get_history(sym, period="1y")
+            if df.empty:
+                index_table.add_row(display, f"${price:.2f}", f"[{chg_style}]{chg_pct:+.2f}%[/{chg_style}]",
+                                    "-", "-", "-", "-", "-")
+                continue
+
+            df = compute_all_indicators(df)
+            latest = df.iloc[-1]
+            rsi = latest.get("rsi", 0)
+
+            sma20 = latest.get("ema_20") or latest.get("sma_20", 0)
+            sma50 = latest.get("sma_50", 0)
+            sma200 = latest.get("sma_200", 0)
+
+            def _vs(sma):
+                if not sma:
+                    return "-"
+                d = (price - sma) / sma * 100
+                s = "green" if d >= 0 else "red"
+                return f"[{s}]{d:+.1f}%[/{s}]"
+
+            # Label
+            if display == "VIX":
+                if price < 15:
+                    label = "[green]Low[/green]"
+                elif price < 20:
+                    label = "[green]Normal[/green]"
+                elif price < 25:
+                    label = "[yellow]Elevated[/yellow]"
+                elif price < 30:
+                    label = "[red]High[/red]"
+                else:
+                    label = "[bold red]Extreme[/bold red]"
+            else:
+                if price > sma50 and price > sma200:
+                    label = "[green]Uptrend[/green]"
+                elif price > sma200:
+                    label = "[yellow]Pullback[/yellow]"
+                else:
+                    label = "[red]Downtrend[/red]"
+
+            rsi_style = "red" if rsi > 70 else "green" if rsi < 30 else "white"
+            index_table.add_row(
+                display,
+                f"${price:.2f}",
+                f"[{chg_style}]{chg_pct:+.2f}%[/{chg_style}]",
+                _vs(sma20), _vs(sma50), _vs(sma200),
+                f"[{rsi_style}]{rsi:.0f}[/{rsi_style}]",
+                label,
+            )
+        except Exception as e:
+            index_table.add_row(display, "-", "-", "-", "-", "-", "-", f"[red]err[/red]")
+            logger.warning("Failed to fetch %s: %s", sym, e)
+
+    console.print(index_table)
+
+    # --- SPY key levels ---
+    try:
+        spy_df = provider.get_history("SPY", period="3mo")
+        if not spy_df.empty:
+            sr = find_support_resistance(spy_df)
+            spy_price = provider.get_quote("SPY").get("price", spy_df["close"].iloc[-1])
+            nearest = get_nearest_levels(spy_price, sr, n=2)
+            r_str = "  ".join(f"${r['level']:.2f}" for r in nearest.get("resistance", []))
+            s_str = "  ".join(f"${s['level']:.2f}" for s in nearest.get("support", []))
+            console.print(f"\n[bold]SPY Key Levels:[/bold]  [red]R: {r_str}[/red]  >  ${spy_price:.2f}  >  [green]S: {s_str}[/green]")
+    except Exception as e:
+        logger.warning("Failed to compute SPY levels: %s", e)
+
+    # --- Sector breadth ---
+    sector_etfs = {
+        "XLK": "Tech", "XLF": "Financials", "XLE": "Energy", "XLV": "Health",
+        "XLI": "Industrials", "XLC": "Comms", "XLY": "Cons Disc", "XLP": "Cons Staples",
+        "XLU": "Utilities", "XLRE": "Real Estate", "XLB": "Materials",
+    }
+
+    console.print("\n[bold]Sector Breadth:[/bold]")
+    breadth_table = Table(show_lines=False, pad_edge=True)
+    breadth_table.add_column("ETF", style="bold", width=5)
+    breadth_table.add_column("Sector", width=12)
+    breadth_table.add_column("Chg%", justify="right", width=8)
+
+    green_count = 0
+    sector_data = []
+    for etf, name in sector_etfs.items():
+        try:
+            q = provider.get_quote(etf)
+            price = q.get("price", 0)
+            prev = q.get("prev_close", 0)
+            chg = ((price - prev) / prev * 100) if prev else 0
+            sector_data.append((etf, name, chg))
+            if chg >= 0:
+                green_count += 1
+        except Exception:
+            sector_data.append((etf, name, 0))
+
+    sector_data.sort(key=lambda x: x[2], reverse=True)
+    for etf, name, chg in sector_data:
+        style = "green" if chg >= 0 else "red"
+        breadth_table.add_row(etf, name, f"[{style}]{chg:+.2f}%[/{style}]")
+
+    console.print(breadth_table)
+
+    total = len(sector_etfs)
+    pct_green = green_count / total * 100 if total else 0
+    breadth_style = "green" if pct_green >= 60 else "yellow" if pct_green >= 40 else "red"
+    console.print(f"\n  [{breadth_style}]Breadth: {green_count}/{total} green ({pct_green:.0f}%)[/{breadth_style}]")
+    if sector_data:
+        console.print(f"  [green]Strongest:[/green] {sector_data[0][0]} ({sector_data[0][1]}) {sector_data[0][2]:+.2f}%")
+        console.print(f"  [red]Weakest:[/red]   {sector_data[-1][0]} ({sector_data[-1][1]}) {sector_data[-1][2]:+.2f}%")
+    console.print()
+
+
+@cli.command("second-day")
+@click.option("--min-change", type=float, default=5.0, help="Minimum yesterday move %.")
+@click.option("--min-vol-ratio", type=float, default=1.5, help="Minimum volume ratio vs avg.")
+@source_option
+def second_day(min_change: float, min_vol_ratio: float, source: str | None):
+    """Find 2nd-day play candidates from yesterday's big movers."""
+    from rich.table import Table
+
+    from tradekit.screener.premarket import scan_previous_movers
+
+    provider = get_provider(source)
+
+    console.print("[bold]Scanning for 2nd-day play candidates...[/bold]")
+    df = scan_previous_movers(
+        provider=provider,
+        min_change_pct=min_change,
+        min_volume_ratio=min_vol_ratio,
+    )
+
+    if df.empty:
+        console.print("[yellow]No 2nd-day candidates found. Try lowering --min-change or --min-vol-ratio.[/yellow]")
+        return
+
+    table = Table(title="2nd Day Play Candidates", show_lines=False, pad_edge=True)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Ticker", style="bold cyan", width=8)
+    table.add_column("Name", width=18, no_wrap=True)
+    table.add_column("Price", justify="right", width=8)
+    table.add_column("Prev Chg%", justify="right", width=10)
+    table.add_column("Vol Ratio", justify="right", width=10)
+    table.add_column("Pre-Mkt", justify="right", width=8)
+    table.add_column("Pre Gap%", justify="right", width=9)
+
+    for i, row in df.iterrows():
+        chg = row["prev_change_pct"]
+        chg_style = "green" if chg > 0 else "red"
+        pre_gap = row.get("pre_gap_pct", 0)
+        pre_style = "green" if pre_gap > 0 else "red" if pre_gap < 0 else "white"
+
+        vol_ratio = row.get("volume_ratio", 0)
+        vol_style = "bold green" if vol_ratio >= 3 else "green" if vol_ratio >= 2 else "yellow"
+
+        pre_price = row.get("pre_price", 0)
+        pre_str = f"${pre_price:.2f}" if pre_price else "-"
+
+        table.add_row(
+            str(int(i) + 1),
+            row["ticker"],
+            str(row.get("name", ""))[:18],
+            f"${row['price']:.2f}",
+            f"[{chg_style}]{chg:+.1f}%[/{chg_style}]",
+            f"[{vol_style}]{vol_ratio:.1f}x[/{vol_style}]",
+            pre_str,
+            f"[{pre_style}]{pre_gap:+.1f}%[/{pre_style}]" if pre_price else "-",
+        )
+
+    console.print(table)
+    tickers = df["ticker"].tolist()
+    console.print(f"\n[dim]Tickers: {', '.join(tickers)}[/dim]")
+    console.print()
 
 
 @cli.command()
